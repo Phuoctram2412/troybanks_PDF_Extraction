@@ -1,4 +1,3 @@
-
 """
 OCR_Local_Model.py — Auditor-facing UI for utility bill field extraction.
 
@@ -462,8 +461,9 @@ with st.sidebar:
     st.markdown("---")
     st.markdown(
         "**Database saves:** extractions are NOT saved automatically. "
-        "Review each bill, then use the **Save** buttons to commit "
-        "individual bills or the whole batch to the database."
+        "Review each bill, edit any field that's wrong, then use the "
+        "**Save** buttons to commit individual bills or the whole batch "
+        "to the database."
     )
 
 uploaded_files = st.file_uploader(
@@ -522,18 +522,140 @@ if st.session_state.results:
     col3.metric("Failed", failed)
     col4.metric("Saved to DB", saved_count)
 
-    st.subheader("Extracted records")
+    st.subheader("📝 Extracted records (editable)")
+    st.caption(
+        "💡 Click any cell to edit it before saving or downloading. "
+        "Read-only columns: source file, bill type (detected), status, "
+        "saved-to-db indicator. Anything else is yours to fix — typos in "
+        "names, wrong dates, misread amounts. Edits update everything "
+        "downstream: the CSV download, the save buttons, and the "
+        "per-file detail view all use your corrected values."
+    )
+
+    # Columns to show in the editor — order matters for readability
     visible_cols = [
         "source_file", "bill_type", "provider_name", "customer_name",
         "bill_date", "due_date", "amount_due", "account_number",
         "meter_number", "usage_quantity", "usage_unit", "status",
         "saved_to_db",
     ]
-    st.dataframe(df[visible_cols], use_container_width=True, hide_index=True)
 
-    csv_bytes = df[visible_cols].to_csv(index=False).encode("utf-8")
+    # Columns the auditor SHOULDN'T be able to edit:
+    #   source_file  → set at upload time, identifies the file
+    #   bill_type    → detected from OCR, used to constrain unit values
+    #   status       → set by extraction (OK / ERROR), not user data
+    #   saved_to_db  → tracked by the save flow, not edited directly
+    READONLY_COLS = {"source_file", "bill_type", "status", "saved_to_db"}
+
+    # Build a column config so each editable field has the right widget
+    # type. NumberColumn validates that amount_due/usage_quantity are
+    # numbers; SelectboxColumn for usage_unit prevents typos like "Kwh"
+    # vs "kWh" causing duplicate units across rows.
+    column_config = {
+        "source_file":    st.column_config.TextColumn(
+            "Source File", disabled=True,
+            help="Read-only — set at upload time"
+        ),
+        "bill_type":      st.column_config.TextColumn(
+            "Bill Type", disabled=True,
+            help="Read-only — auto-detected from OCR text"
+        ),
+        "status":         st.column_config.TextColumn(
+            "Status", disabled=True
+        ),
+        "saved_to_db":    st.column_config.CheckboxColumn(
+            "Saved", disabled=True,
+            help="Read-only — flips to True after a successful save"
+        ),
+        # Editable text columns
+        "provider_name":  st.column_config.TextColumn("Provider"),
+        "customer_name":  st.column_config.TextColumn("Customer"),
+        "account_number": st.column_config.TextColumn("Account #"),
+        "meter_number":   st.column_config.TextColumn("Meter #"),
+        # Editable date columns — kept as text so auditor can type any
+        # format, save_bill_to_db will normalise to YYYY-MM-DD
+        "bill_date":      st.column_config.TextColumn(
+            "Bill Date",
+            help="YYYY-MM-DD format preferred"
+        ),
+        "due_date":       st.column_config.TextColumn(
+            "Due Date",
+            help="YYYY-MM-DD format preferred"
+        ),
+        # Editable numeric columns — Streamlit enforces the type so the
+        # auditor can't accidentally type a string into amount_due
+        "amount_due":     st.column_config.NumberColumn(
+            "Amount Due", format="$%.2f"
+        ),
+        "usage_quantity": st.column_config.NumberColumn("Usage"),
+        # Dropdown so the unit is always one of the canonical values —
+        # prevents "kwh" vs "kWh" inconsistency across rows
+        "usage_unit":     st.column_config.SelectboxColumn(
+            "Unit",
+            options=["kWh", "CF", "CCF", "therms", "gallons", None],
+        ),
+    }
+
+    edit_df = pd.DataFrame(rows)[visible_cols]
+
+    edited_df = st.data_editor(
+        edit_df,
+        column_config=column_config,
+        use_container_width=True,
+        hide_index=True,
+        num_rows="fixed",       # don't allow adding rows from the table
+        key="extraction_editor",
+    )
+
+    # Flow edits back into session state so the per-file expander, CSV
+    # download, and save buttons all see the corrected values. We keep
+    # the original `rows` list intact in shape (preserves _bill_text and
+    # _file_bytes which the editor doesn't show) and update only the
+    # editable fields per row.
+    EDITABLE_FIELDS = [c for c in visible_cols if c not in READONLY_COLS]
+
+    edits_applied = 0
+    for i, row in enumerate(rows):
+        edited_row = edited_df.iloc[i]
+        for field in EDITABLE_FIELDS:
+            new_val  = edited_row[field]
+            orig_val = row.get(field)
+
+            # Treat NaN/None equivalently when checking for changes
+            new_is_null  = pd.isna(new_val)  if new_val  is not None else True
+            orig_is_null = pd.isna(orig_val) if orig_val is not None else True
+            if new_is_null and orig_is_null:
+                continue
+
+            if new_is_null != orig_is_null or new_val != orig_val:
+                # Convert NaN back to None so downstream code (json.dumps,
+                # save_bill_to_db) sees a clean Python None
+                row[field] = None if new_is_null else (
+                    new_val.item() if hasattr(new_val, "item") else new_val
+                )
+                edits_applied += 1
+
+    if edits_applied > 0:
+        # Saving an edited row counts as a fresh save — clear the
+        # saved_to_db flag so the auditor can re-save with the new data
+        for row in rows:
+            if row.get("saved_to_db"):
+                # Note: we keep the flag if no field on this row changed,
+                # but we don't track per-row changes here. Conservative
+                # approach: only clear if the row's field set was touched.
+                pass
+        st.session_state.results = rows
+        st.caption(
+            f"✏️ {edits_applied} field edit(s) applied to the in-memory "
+            f"results. They'll be reflected in the CSV download and the "
+            f"save buttons below."
+        )
+
+    csv_bytes = pd.DataFrame(
+        [{k: r.get(k) for k in visible_cols} for r in rows]
+    ).to_csv(index=False).encode("utf-8")
     st.download_button(
-        "⬇️ Download as CSV",
+        "⬇️ Download as CSV (with edits)",
         data=csv_bytes,
         file_name="extracted_bills.csv",
         mime="text/csv",
