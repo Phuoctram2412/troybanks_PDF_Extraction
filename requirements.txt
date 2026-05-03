@@ -1,0 +1,11 @@
+pandas==3.0.2
+requests==2.33.1
+streamlit==1.56.0
+pymupdf==1.27.2.2
+Pillow==12.2.0
+python-dotenv==1.2.2
+google-genai==1.72.0
+opencv-python==4.13.0.92
+numpy==2.4.4
+pdfplumber==0.11.9
+pytesseract==0.3.13
