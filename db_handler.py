@@ -479,7 +479,7 @@ def process_batch(pdf_files: list,
     Processes a list of bill files through Gemini and saves each to the db.
     Returns a summary dict with total/saved/skipped/failed counts.
     """
-    from extractor.extractor import extract_bill
+    from extractor import extract_bill
     import time
 
     summary = {"total": len(pdf_files), "saved": 0, "skipped": 0, "failed": 0}
